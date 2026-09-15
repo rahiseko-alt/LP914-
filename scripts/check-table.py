@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""固定表の検品。表そのものに穴が無いかだけを見る。
+"""固定表の検品。表そのものに穴が無いかを見る。
 
 対象アプリには一切触れない。読むのは同梱した公式データと `docs/safety-check/table/` だけ。
 確かめるのは次の6点。
@@ -15,6 +15,14 @@
      （0件の意味が種類で逆になるため。`docs/adr/0006`）
   7. 「原文」が公式データの原文と**一字一句一致**すること
      （途中で切ると、標準が条件付きで求めている部分を落としたまま合格を出してしまう）
+  8. 公式データの L1 項目が**1つ残らず**表に載っていること
+     （章のファイルごと消えても、件数が減るだけで緑のまま通ってしまわないように）
+  9. 同じ欄が1つの項目に2回書かれていないこと（先に書いたほうが黙って勝つのを防ぐ）
+ 10. 命令に `2>/dev/null` が無いこと、対象アプリ固有の置き場所の名前が無いこと
+     （別のアプリに当てたとき、黙って0件＝合格になるのを防ぐ）
+
+`--results` を付けると、判定結果（`docs/safety-check/results/<対象アプリ>/`）も見る。
+判定結果の項目を数え、固定表と突き合わせ、`機械` と `読む` の内訳を出す。**目で数えない。**
 
 同梱した公式データ自体が壊れている場合は、検品の前提が崩れているため即座に止める。
 終了コードは、問題が1件でもあれば 1、無ければ 0。
@@ -48,6 +56,7 @@ class Item:
     item_id: str
     line: int
     fields: dict = field(default_factory=dict)
+    duplicated: set = field(default_factory=set)
 
     def value(self, name):
         return self.fields.get(name, "")
@@ -82,7 +91,11 @@ def parse_table(path):
             continue
         pair = ITEM_FIELD.match(line)
         if pair and items:
-            items[-1].fields.setdefault(pair.group(1), pair.group(2).strip())
+            name = pair.group(1)
+            if name in items[-1].fields:
+                items[-1].duplicated.add(name)
+            else:
+                items[-1].fields[name] = pair.group(2).strip()
     return items
 
 
@@ -108,6 +121,8 @@ def check_item(item, rel, official, seen, problems):
     for name in REQUIRED_FIELDS:
         if not item.value(name):
             problems.append(f"{where} の「{name}」が空")
+    for name in sorted(item.duplicated):
+        problems.append(f"{where} の「{name}」が2回書かれている（先に書いたほうが黙って勝つ）")
 
     method = item.value("判定のしかた")
     if method and method not in JUDGEMENT_METHODS:
@@ -127,6 +142,30 @@ def check_item(item, rel, official, seen, problems):
             )
 
 
+BANNED_IN_COMMAND = {
+    "2>/dev/null": "失敗を隠している。別のアプリに当てたとき黙って0件＝合格になる",
+    "worker/src": "対象アプリ固有の置き場所の名前",
+    "backend/js": "対象アプリ固有の置き場所の名前",
+    "supabase/": "対象アプリ固有の置き場所の名前",
+    "src/js": "対象アプリ固有の置き場所の名前",
+}
+
+
+def check_commands(path, problems):
+    """表に書かれた命令が、README の決まりを守っているかを見る。"""
+    rel = path.relative_to(ROOT)
+    inside = False
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if line.strip().startswith("```"):
+            inside = not inside
+            continue
+        if not inside:
+            continue
+        for banned, reason in BANNED_IN_COMMAND.items():
+            if banned in line:
+                problems.append(f"{rel}:{lineno} 命令に `{banned}` がある（{reason}）")
+
+
 def report_coverage(official, seen):
     print(f"公式データ: L1 {len(official)} 項目")
     print(f"表に載っている項目: {len(seen)} / {len(official)}")
@@ -140,6 +179,7 @@ def main():
     official = official_l1()
     problems = []
     seen = {}
+    methods = {}
 
     tables = sorted(TABLE_DIR.glob("V*.md"))
     if not tables:
@@ -152,8 +192,10 @@ def main():
             problems.append(f"{rel}: 項目が1つも読み取れない（見出しが `### v5.0.0-X.Y.Z` の形か確認）")
             continue
 
+        check_commands(path, problems)
         for item in items:
             check_item(item, rel, official, seen, problems)
+            methods[item.item_id] = item.value("判定のしかた")
 
         present = {item.item_id for item in items}
         for chapter in sorted({official[i][0] for i in present if i in official}):
@@ -161,7 +203,17 @@ def main():
             for item_id in sorted(missing):
                 problems.append(f"{rel}: {chapter} の {item_id} が載っていない")
 
+    for item_id in sorted(set(official) - set(seen)):
+        problems.append(f"{official[item_id][0]} の {item_id} が、どの表にも載っていない")
+
     report_coverage(official, seen)
+    by_method = {}
+    for value in methods.values():
+        by_method[value] = by_method.get(value, 0) + 1
+    print("判定のしかたの内訳: " + " / ".join(f"{k} {v}" for k, v in sorted(by_method.items())))
+
+    if "--results" in sys.argv:
+        problems += check_results(official, methods)
 
     if problems:
         print(f"\n問題 {len(problems)} 件")
@@ -171,6 +223,59 @@ def main():
 
     print("\n問題なし")
     return 0
+
+
+RESULTS_DIR = ROOT / "docs" / "safety-check" / "results"
+RESULT_HEADING = re.compile(r"^### (v5\.0\.0-[\d.]+)")
+RESULT_VERDICT = re.compile(r"^\*\*判定: (.+?)\*\*")
+VERDICTS = ("合格", "合格（該当機能なし）", "不合格", "判定不能")
+
+
+def check_results(official, methods):
+    """判定結果を数え、固定表と突き合わせる。目で数えないための仕組み。"""
+    problems = []
+    for app_dir in sorted(d for d in RESULTS_DIR.iterdir() if d.is_dir()):
+        seen = {}
+        counts = {}
+        for path in sorted(app_dir.glob("*.md")):
+            rel = path.relative_to(ROOT)
+            current = None
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                heading = RESULT_HEADING.match(line)
+                if heading:
+                    current = (heading.group(1), rel, lineno)
+                    continue
+                verdict = RESULT_VERDICT.match(line)
+                if verdict and current:
+                    item_id, where, at = current
+                    current = None
+                    if item_id in seen:
+                        problems.append(f"{rel}:{at} {item_id} は {seen[item_id]} にも判定がある")
+                        continue
+                    seen[item_id] = where
+                    value = verdict.group(1)
+                    if value not in VERDICTS:
+                        problems.append(
+                            f"{where}:{at} {item_id} の判定が `{value}`。"
+                            f"{' / '.join(VERDICTS)} のどれかにする"
+                        )
+                    counts[value] = counts.get(value, 0) + 1
+
+        print(f"\n対象アプリ: {app_dir.name}")
+        print(f"  判定した項目: {len(seen)} / {len(official)}")
+        for value in VERDICTS:
+            if counts.get(value):
+                print(f"    {value}: {counts[value]}")
+        by_method = {}
+        for item_id in seen:
+            by_method[methods.get(item_id, "不明")] = by_method.get(methods.get(item_id, "不明"), 0) + 1
+        print("  判定のしかたの内訳: " + " / ".join(f"{k} {v}" for k, v in sorted(by_method.items())))
+
+        for item_id in sorted(set(official) - set(seen)):
+            problems.append(f"{app_dir.name}: {item_id} が判定されていない")
+        for item_id in sorted(set(seen) - set(official)):
+            problems.append(f"{app_dir.name}: {item_id} は固定表に無い")
+    return problems
 
 
 if __name__ == "__main__":
